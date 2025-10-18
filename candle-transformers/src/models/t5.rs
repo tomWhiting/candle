@@ -663,7 +663,7 @@ impl T5LayerCrossAttention {
 }
 
 #[derive(Debug, Clone)]
-struct T5Block {
+pub struct T5Block {
     self_attn: T5LayerSelfAttention,
     cross_attn: Option<T5LayerCrossAttention>,
     ff: T5LayerFF,
@@ -734,7 +734,7 @@ impl T5Block {
 }
 
 #[derive(Debug, Clone)]
-struct T5Stack {
+pub struct T5Stack {
     block: Vec<T5Block>,
     shared: Arc<Embedding>,
     final_layer_norm: T5LayerNorm,
@@ -742,7 +742,7 @@ struct T5Stack {
 }
 
 impl T5Stack {
-    fn load(decoder: bool, vb: VarBuilder, shared: &Arc<Embedding>, cfg: &Config) -> Result<Self> {
+    pub fn load(decoder: bool, vb: VarBuilder, shared: &Arc<Embedding>, cfg: &Config) -> Result<Self> {
         let block = (0..cfg.num_layers)
             .map(|i| T5Block::load(i == 0, decoder, vb.pp(format!("block.{i}")), cfg))
             .collect::<Result<Vec<_>>>()?;
@@ -759,7 +759,7 @@ impl T5Stack {
         })
     }
 
-    fn forward(
+    pub fn forward(
         &mut self,
         input_ids: &Tensor,
         encoder_hidden_states: Option<&Tensor>,
@@ -780,6 +780,35 @@ impl T5Stack {
             Some(dtype) => input_embeds.to_dtype(dtype)?,
         };
         let mut hidden_states = input_embeds;
+        let mut position_bias = None;
+        for block in self.block.iter_mut() {
+            (hidden_states, position_bias) = block.forward(
+                &hidden_states,
+                position_bias.as_ref(),
+                encoder_hidden_states,
+            )?
+        }
+        self.final_layer_norm.forward(&hidden_states)
+    }
+
+    /// Forward pass with continuous embeddings (bypass embedding layer).
+    ///
+    /// This is useful for models like Chronos Bolt that use custom patch embeddings
+    /// instead of the standard token embedding layer.
+    ///
+    /// # Arguments
+    /// * `input_embeds` - Continuous embeddings [batch, seq_len, d_model]
+    /// * `encoder_hidden_states` - Optional encoder outputs for decoder
+    ///
+    /// # Returns
+    /// Hidden states after all transformer blocks and final layer norm
+    pub fn forward_with_embeddings(
+        &mut self,
+        input_embeds: &Tensor,
+        encoder_hidden_states: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let mut hidden_states = input_embeds.clone();
         let mut position_bias = None;
         for block in self.block.iter_mut() {
             (hidden_states, position_bias) = block.forward(
@@ -850,6 +879,7 @@ pub struct T5ForConditionalGeneration {
     lm_head: Option<Linear>,
     shared: Arc<Embedding>,
     device: Device,
+    span_encode: tracing::Span,
     span_decode: tracing::Span,
     span_decode_head: tracing::Span,
 }
@@ -897,12 +927,16 @@ impl T5ForConditionalGeneration {
             lm_head,
             shared,
             device: vb.device().clone(),
+            span_encode: tracing::span!(tracing::Level::TRACE, "encode"),
             span_decode: tracing::span!(tracing::Level::TRACE, "decode"),
             span_decode_head: tracing::span!(tracing::Level::TRACE, "decode-head"),
         })
     }
 
+    /// Get encoder output for two-stage encoding/decoding
+    /// Returns: [batch, seq_len, d_model]
     pub fn encode(&mut self, input_ids: &Tensor) -> Result<Tensor> {
+        let _enter = self.span_encode.enter();
         self.encoder.forward(input_ids, None)
     }
 
@@ -935,6 +969,30 @@ impl T5ForConditionalGeneration {
             }
         };
         Ok(output)
+    }
+
+    /// Decode with full hidden states (for custom prediction heads)
+    ///
+    /// # Arguments
+    /// * `decoder_input_ids` - Input token IDs for decoder
+    /// * `encoder_output` - Output from encode() method
+    ///
+    /// # Returns
+    /// Decoder hidden states with shape [batch, seq_len, d_model]
+    ///
+    /// # Example
+    /// ```rust
+    /// let encoder_output = model.encode(&input_ids)?;
+    /// let decoder_hidden = model.decode_with_hidden_states(&decoder_ids, &encoder_output)?;
+    /// // Apply custom heads to decoder_hidden
+    /// ```
+    pub fn decode_with_hidden_states(
+        &mut self,
+        decoder_input_ids: &Tensor,
+        encoder_output: &Tensor,
+    ) -> Result<Tensor> {
+        let _enter = self.span_decode.enter();
+        self.decoder.forward(decoder_input_ids, Some(encoder_output))
     }
 
     pub fn forward(&mut self, input_ids: &Tensor, decoder_input_ids: &Tensor) -> Result<Tensor> {
