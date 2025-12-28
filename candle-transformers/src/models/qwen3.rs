@@ -291,18 +291,29 @@ pub struct Model {
 
 impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let embed_tokens =
-            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
+        // Embedding models use weights without "model." prefix (e.g., embed_tokens.weight)
+        // Causal LM models use "model." prefix (e.g., model.embed_tokens.weight)
+        // Try without prefix first (embedding models), fall back to with prefix (causal LM)
+        let embed_tokens = candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))
+            .or_else(|_| candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens")))?;
         let rotary = Arc::new(Qwen3RotaryEmbedding::new(vb.dtype(), cfg, vb.device())?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        let vb_l = vb.pp("model.layers");
+        // Try without prefix first, fall back to with prefix
+        let vb_l = if vb.contains_tensor("layers.0.input_layernorm.weight") {
+            vb.pp("layers")
+        } else {
+            vb.pp("model.layers")
+        };
         for i in 0..cfg.num_hidden_layers {
             layers.push(DecoderLayer::new(cfg, rotary.clone(), vb_l.pp(i))?);
         }
+        // Try without prefix first, fall back to with prefix
+        let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))
+            .or_else(|_| RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm")))?;
         Ok(Self {
             embed_tokens,
             layers,
-            norm: RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?,
+            norm,
             device: vb.device().clone(),
             dtype: vb.dtype(),
         })
@@ -353,6 +364,25 @@ impl Model {
 
         for layer in &mut self.layers {
             h = layer.forward(&h, causal.as_ref(), offset)?;
+        }
+        self.norm.forward(&h)
+    }
+
+    /// Forward pass for embedding generation (bidirectional attention).
+    ///
+    /// Unlike [`forward`], this method uses bidirectional attention without
+    /// causal masking, making it suitable for generating text embeddings.
+    /// The KV cache is cleared before each call since embeddings don't need
+    /// autoregressive generation.
+    pub fn forward_embeddings(&mut self, input: &Tensor) -> Result<Tensor> {
+        // Clear KV cache - embeddings don't need cached states
+        self.clear_kv_cache();
+
+        let mut h = self.embed_tokens.forward(input)?;
+
+        // No causal mask - bidirectional attention for embeddings
+        for layer in &mut self.layers {
+            h = layer.forward(&h, None, 0)?;
         }
         self.norm.forward(&h)
     }
