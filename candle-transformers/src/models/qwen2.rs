@@ -284,7 +284,14 @@ pub struct Model {
 
 impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let vb_m = vb.pp("model");
+        // Detect if tensors use "model." prefix by checking if "model.embed_tokens.weight" exists
+        // Some models (e.g., jina-code-embeddings) don't use the "model." prefix
+        let vb_m = if vb.contains_tensor("model.embed_tokens.weight") {
+            vb.pp("model")
+        } else {
+            // No "model." prefix - use VarBuilder directly
+            vb.clone()
+        };
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
         let rotary_emb = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb_m.device())?);
