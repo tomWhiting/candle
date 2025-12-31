@@ -361,6 +361,25 @@ impl Model {
         xs.apply(&self.norm)
     }
 
+    /// Forward pass for embedding generation (bidirectional attention).
+    ///
+    /// Unlike [`forward`], this method uses bidirectional attention without
+    /// causal masking, making it suitable for generating text embeddings.
+    /// The KV cache is cleared before each call since embeddings don't need
+    /// autoregressive generation.
+    pub fn forward_embeddings(&mut self, input_ids: &Tensor) -> Result<Tensor> {
+        // Clear KV cache - embeddings don't need cached states
+        self.clear_kv_cache();
+
+        let mut xs = self.embed_tokens.forward(input_ids)?;
+
+        // No causal mask - bidirectional attention for embeddings
+        for layer in self.layers.iter_mut() {
+            xs = layer.forward(&xs, None, 0)?
+        }
+        xs.apply(&self.norm)
+    }
+
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
