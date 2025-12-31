@@ -28,13 +28,23 @@ pub struct Config {
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub max_position_embeddings: usize,
-    pub sliding_window: usize,
+    /// Sliding window size. Optional because some Qwen2 variants (e.g., embedding models) set this to null.
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+    #[serde(default)]
     pub max_window_layers: usize,
+    #[serde(default)]
     pub tie_word_embeddings: bool,
+    #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
     pub rms_norm_eps: f64,
+    #[serde(default)]
     pub use_sliding_window: bool,
     pub hidden_act: Activation,
+}
+
+fn default_rope_theta() -> f64 {
+    10000.0
 }
 
 #[derive(Debug, Clone)]
@@ -266,7 +276,8 @@ pub struct Model {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
-    sliding_window: usize,
+    /// Sliding window size. None means full attention (no sliding window).
+    sliding_window: Option<usize>,
     device: Device,
     dtype: DType,
 }
@@ -300,11 +311,12 @@ impl Model {
         tgt_len: usize,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
-        // Sliding window mask?
+        // Sliding window mask - if None, use full attention (no sliding window constraint)
+        let sliding_window = self.sliding_window.unwrap_or(usize::MAX);
         let mask: Vec<_> = (0..tgt_len)
             .flat_map(|i| {
                 (0..tgt_len).map(move |j| {
-                    if i < j || j + self.sliding_window < i {
+                    if i < j || j + sliding_window < i {
                         f32::NEG_INFINITY
                     } else {
                         0.
